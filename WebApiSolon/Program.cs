@@ -16,14 +16,14 @@ var builder = WebApplication.CreateBuilder(args);
 var useInMemory = builder.Configuration.GetValue<bool>("UseInMemoryDatabase");
 builder.Services.AddDbContext<DatabaseContext>(options =>
 {
-    if (useInMemory)
-    {
-        options.UseInMemoryDatabase("SolonSalonDev");
-    }
-    else
-    {
-        options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"));
-    }
+    //if (useInMemory)
+    //{
+    //    options.UseInMemoryDatabase("SolonSalonDev");
+    //}
+    //else
+    //{
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"));
+    //}
 });
 
 // ثبت سرویس‌های اختصاصی احراز هویت و ذخیره‌سازی فایل

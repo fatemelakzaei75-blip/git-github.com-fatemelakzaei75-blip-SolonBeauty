@@ -3,8 +3,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Security.Claims;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using DataCore.Interfaces;
 using DataCore.Models.Common;
 using DataCore.Models.ViewModels;
@@ -18,7 +16,7 @@ using WebApiSolon.Services;
 namespace WebApiSolon.Controllers;
 
 /// <summary>
-/// کنترلر RESTful احراز هویت کاربران، ورود دوحالته (OTP / Password) و صدور توکن امنیتی JWT
+/// کنترلر احراز هویت کاربران، ورود با OTP و رمز عبور و صدور JWT
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
@@ -30,8 +28,6 @@ public class AuthController : BaseApiController
     private readonly UserRoleService _userRoleService;
     private readonly JwtTokenService _jwtTokenService;
     private readonly ILogger<AuthController> _logger;
-
-    public const string DevCode = ConfirmService.DevCode;
 
     private static readonly Dictionary<string, (string Name, string Role)> DemoUsers = new()
     {
@@ -63,93 +59,234 @@ public class AuthController : BaseApiController
     public ActionResult SendCode([FromBody] SendCodeRequest request)
     {
         request.MobileNumber = DigitHelper.Normalize(request.MobileNumber);
+
         if (!IsValidMobile(request.MobileNumber))
         {
-            return BadRequest(new { Success = false, Message = "شماره موبایل معتبر نمی‌باشد (الگو: ۰۹۱۲۳۴۵۶۷۸۹)" });
+            return BadRequest(new
+            {
+                Success = false,
+                Message = "شماره موبایل معتبر نمی‌باشد."
+            });
         }
 
         try
         {
-            _confirmService.SendCode(request.MobileNumber);
+            var ipUser =
+                HttpContext.Connection.RemoteIpAddress?.ToString()
+                ?? "-";
+
+            _confirmService.SendCode(
+                request.MobileNumber,
+                ipUser);
+
+            Response.Headers.Append(
+                "Link",
+                "</api/auth/login>; rel=\"login-otp\"");
+
+            return Ok(new
+            {
+                Success = true,
+                Message = "کد تأیید با موفقیت ایجاد شد."
+            });
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "ارسال کد بدون دیتابیس (حالت توسعه)");
+            _logger.LogError(
+                ex,
+                "خطا در ایجاد کد تأیید برای شماره {MobileNumber}",
+                request.MobileNumber);
+
+            return StatusCode(500, new
+            {
+                Success = false,
+                Message = "در ایجاد کد تأیید خطایی رخ داد."
+            });
         }
-
-        Response.Headers.Append("Link", "</api/auth/login>; rel=\"login-otp\", </api/auth/login-password>; rel=\"login-password\"");
-
-        return Ok(new { Success = true, Message = $"کد تأیید ارسال شد (کد پیش‌فرض محیط تست: {DevCode})" });
     }
 
     /// <summary>
-    /// ورود با شماره موبایل و کد یکبار مصرف (SMS OTP)
+    /// ورود با شماره موبایل و کد یکبار مصرف OTP
     /// </summary>
     [HttpPost("login")]
-    public ActionResult<LoginResponse> Login([FromBody] LoginRequest request)
+    public ActionResult<LoginResponse> Login(
+        [FromBody] LoginRequest request)
     {
-        request.MobileNumber = DigitHelper.Normalize(request.MobileNumber);
-        request.Code = DigitHelper.Normalize(request.Code);
+        request.MobileNumber =
+            DigitHelper.Normalize(request.MobileNumber);
 
-        if (!IsValidMobile(request.MobileNumber) || string.IsNullOrWhiteSpace(request.Code))
+        request.Code =
+            DigitHelper.Normalize(request.Code);
+
+        if (!IsValidMobile(request.MobileNumber) ||
+            string.IsNullOrWhiteSpace(request.Code))
         {
-            return BadRequest(new { Success = false, Message = "شماره همراه یا کد تأیید نامعتبر است." });
+            return BadRequest(new
+            {
+                Success = false,
+                Message = "شماره همراه یا کد تأیید نامعتبر است."
+            });
         }
 
-        var roles = new List<string>();
-        var displayName = "کاربر گرامی";
-        var tc = Guid.NewGuid();
-        var verified = false;
+        // بررسی واقعی کد OTP از دیتابیس
+        var verified = _confirmService.VerifyCode(
+            request.MobileNumber,
+            request.Code,
+            out var verifyMessage);
+
+
+        if (!verified)
+        {
+            return Unauthorized(new
+            {
+                Success = false,
+                Message = verifyMessage
+            });
+        }
 
         try
         {
-            verified = _confirmService.VerifyCode(request.MobileNumber, request.Code);
-            if (verified)
-            {
-                var mobile = _mobileService.Create(request.MobileNumber);
-                tc = mobile.Tc;
+            // دریافت یا ایجاد رکورد موبایل
+            var mobile =
+                _mobileService.Create(request.MobileNumber);
 
-                if (Guid.TryParse(mobile.TcPersonal, out var personalTc) && personalTc != Guid.Empty)
+            if (mobile == null ||
+                mobile.Tc == Guid.Empty)
+            {
+                return Unauthorized(new
                 {
-                    tc = personalTc;
-                    roles = _userRoleService.GetRoleNamesByPersonalTc(personalTc);
-                    displayName = "پرسنل سالن";
-                }
-                else if (_customerService.IsCustomerExists(mobile.Tc))
-                {
-                    displayName = _customerService.GetCustomerByToken(mobile.Tc).FullName;
-                    roles.Add("Customer");
-                }
+                    Success = false,
+                    Message = "اطلاعات شماره موبایل قابل بازیابی نیست."
+                });
             }
+
+            var tc = mobile.Tc;
+
+            var roles = new List<string>();
+
+            var displayName =
+                $"کاربر {request.MobileNumber[^4..]}";
+
+            // بررسی پرسنل
+            if (Guid.TryParse(
+                    mobile.TcPersonal,
+                    out var personalTc) &&
+                personalTc != Guid.Empty)
+            {
+                tc = personalTc;
+
+                roles =
+                    _userRoleService
+                        .GetRoleNamesByPersonalTc(personalTc);
+
+                if (roles == null)
+                {
+                    roles = new List<string>();
+                }
+
+                displayName = "پرسنل سالن";
+            }
+            // بررسی مشتری
+            else if (_customerService.IsCustomerExists(mobile.Tc))
+            {
+                var customer =
+                    _customerService.GetCustomerByToken(mobile.Tc);
+
+                if (customer != null)
+                {
+                    displayName = customer.FullName;
+                }
+
+                roles.Add("Customer");
+            }
+            // شماره تأیید شده ولی هنوز پروفایل مشتری ندارد
+            else
+            {
+                roles.Add("Customer");
+            }
+
+            var (token, expires) =
+                _jwtTokenService.CreateToken(
+                    tc,
+                    displayName,
+                    request.MobileNumber,
+                    roles);
+
+            Response.Headers.Append(
+                "Link",
+                "</api/auth/me>; rel=\"me\"");
+
+            return Ok(new LoginResponse
+            {
+                Token = token,
+                ExpiresAt = expires,
+                DisplayName = displayName,
+                MobileNumber = request.MobileNumber,
+                Tc = tc,
+                Roles = roles
+            });
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "ورود در حالت شبیه‌سازی توسعه");
-        }
+            _logger.LogError(
+                ex,
+                "خطا در ورود کاربر با شماره {MobileNumber}",
+                request.MobileNumber);
 
-        if (!verified || roles.Count == 0)
-        {
-            if (request.Code != DevCode || !DemoUsers.TryGetValue(request.MobileNumber, out var demo))
+            return StatusCode(500, new
             {
-                return Unauthorized(new { Success = false, Message = "شماره موبایل یا کد تأیید نادرست است." });
-            }
+                Success = false,
+                Message = ex.Message,
+                Detail = ex.InnerException?.Message
+            });
+        }
+    }
 
-            displayName = demo.Name;
-            roles = new List<string> { demo.Role };
+    /// <summary>
+    /// بازیابی کلمه عبور با استفاده از کد پیامکی
+    /// </summary>
+    [HttpPost("reset-password")]
+    public ActionResult ResetPassword(
+        [FromBody] ResetPasswordRequest request)
+    {
+        request.MobileNumber =
+            DigitHelper.Normalize(request.MobileNumber);
+
+        request.Code =
+            DigitHelper.Normalize(request.Code);
+
+        if (!IsValidMobile(request.MobileNumber) ||
+            string.IsNullOrWhiteSpace(request.Code) ||
+            string.IsNullOrWhiteSpace(request.NewPassword))
+        {
+            return BadRequest(new
+            {
+                Success = false,
+                Message = "اطلاعات ارسالی کامل نمی‌باشد."
+            });
         }
 
-        var (token, expires) = _jwtTokenService.CreateToken(tc, displayName, request.MobileNumber, roles);
+        var verified =
+            _confirmService.VerifyCode(
+                request.MobileNumber,
+                request.Code,
+                out var verifyMessage);
 
-        Response.Headers.Append("Link", "</api/auth/me>; rel=\"me\", </api/reservation>; rel=\"reservations\"");
-
-        return Ok(new LoginResponse
+        if (!verified)
         {
-            Token = token,
-            ExpiresAt = expires,
-            DisplayName = displayName,
-            MobileNumber = request.MobileNumber,
-            Tc = tc,
-            Roles = roles
+            return Unauthorized(new
+            {
+                Success = false,
+                Message = verifyMessage
+            });
+        }
+
+        // فعلاً فقط تأیید کد انجام می‌شود.
+        // ذخیره واقعی رمز عبور در مرحله بعد پیاده‌سازی می‌شود.
+
+        return Ok(new
+        {
+            Success = true,
+            Message = "کد تأیید با موفقیت تأیید شد."
         });
     }
 
@@ -157,37 +294,68 @@ public class AuthController : BaseApiController
     /// ورود با شماره موبایل و رمز عبور ثابت
     /// </summary>
     [HttpPost("login-password")]
-    public ActionResult<LoginResponse> LoginWithPassword([FromBody] LoginPasswordRequest request)
+    public ActionResult<LoginResponse> LoginWithPassword(
+        [FromBody] LoginPasswordRequest request)
     {
-        request.MobileNumber = DigitHelper.Normalize(request.MobileNumber);
-        if (!IsValidMobile(request.MobileNumber) || string.IsNullOrWhiteSpace(request.Password))
+        request.MobileNumber =
+            DigitHelper.Normalize(request.MobileNumber);
+
+        if (!IsValidMobile(request.MobileNumber) ||
+            string.IsNullOrWhiteSpace(request.Password))
         {
-            return BadRequest(new { Success = false, Message = "شماره همراه یا کلمه عبور نامعتبر است." });
+            return BadRequest(new
+            {
+                Success = false,
+                Message = "شماره همراه یا کلمه عبور نامعتبر است."
+            });
         }
 
-        if (request.Password != "123456" && request.Password != "Admin@123456")
+        if (request.Password != "123456" &&
+            request.Password != "Admin@123456")
         {
-            return Unauthorized(new { Success = false, Message = "کلمه عبور وارد شده نادرست است (رمز پیش‌فرض تست: 123456)" });
+            return Unauthorized(new
+            {
+                Success = false,
+                Message =
+                    "کلمه عبور وارد شده نادرست است."
+            });
         }
 
-        if (!DemoUsers.TryGetValue(request.MobileNumber, out var demo))
+        if (!DemoUsers.TryGetValue(
+                request.MobileNumber,
+                out var demo))
         {
             var customerTc = Guid.NewGuid();
-            var roles = new List<string> { "Customer" };
-            var (token, expires) = _jwtTokenService.CreateToken(customerTc, $"کاربر {request.MobileNumber[^4..]}", request.MobileNumber, roles);
+
+            var roles =
+                new List<string> { "Customer" };
+
+            var (token, expires) =
+                _jwtTokenService.CreateToken(
+                    customerTc,
+                    $"کاربر {request.MobileNumber[^4..]}",
+                    request.MobileNumber,
+                    roles);
 
             return Ok(new LoginResponse
             {
                 Token = token,
                 ExpiresAt = expires,
-                DisplayName = $"کاربر {request.MobileNumber[^4..]}",
-                MobileNumber = request.MobileNumber,
+                DisplayName =
+                    $"کاربر {request.MobileNumber[^4..]}",
+                MobileNumber =
+                    request.MobileNumber,
                 Tc = customerTc,
                 Roles = roles
             });
         }
 
-        var (demoToken, demoExpires) = _jwtTokenService.CreateToken(Guid.NewGuid(), demo.Name, request.MobileNumber, new List<string> { demo.Role });
+        var (demoToken, demoExpires) =
+            _jwtTokenService.CreateToken(
+                Guid.NewGuid(),
+                demo.Name,
+                request.MobileNumber,
+                new List<string> { demo.Role });
 
         return Ok(new LoginResponse
         {
@@ -201,42 +369,7 @@ public class AuthController : BaseApiController
     }
 
     /// <summary>
-    /// بازیابی کلمه عبور با استفاده از کد پیامکی
-    /// </summary>
-    [HttpPost("reset-password")]
-    public ActionResult ResetPassword([FromBody] ResetPasswordRequest request)
-    {
-        request.MobileNumber = DigitHelper.Normalize(request.MobileNumber);
-        request.Code = DigitHelper.Normalize(request.Code);
-
-        if (!IsValidMobile(request.MobileNumber) || string.IsNullOrWhiteSpace(request.Code) || string.IsNullOrWhiteSpace(request.NewPassword))
-        {
-            return BadRequest(new { Success = false, Message = "اطلاعات ارسالی کامل نمی‌باشد." });
-        }
-
-        bool verified = (request.Code == DevCode);
-        if (!verified)
-        {
-            try
-            {
-                verified = _confirmService.VerifyCode(request.MobileNumber, request.Code);
-            }
-            catch
-            {
-                // نادیده گرفتن خطا در دمو
-            }
-        }
-
-        if (!verified)
-        {
-            return Unauthorized(new { Success = false, Message = "کد تأیید نامعتبر یا منقضی گردیده است." });
-        }
-
-        return Ok(new { Success = true, Message = "رمز عبور جدید با موفقیت تنظیم گردید." });
-    }
-
-    /// <summary>
-    /// دریافت پروفایل و نقش‌های کاربر جاری از توکن JWT
+    /// دریافت پروفایل و نقش‌های کاربر جاری از JWT
     /// </summary>
     [Authorize]
     [HttpGet("me")]
@@ -244,15 +377,31 @@ public class AuthController : BaseApiController
     {
         return Ok(new LoginResponse
         {
-            DisplayName = User.FindFirstValue(ClaimTypes.Name) ?? "",
-            MobileNumber = User.FindFirstValue(ClaimTypes.MobilePhone) ?? "",
-            Tc = Guid.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var g) ? g : Guid.Empty,
-            Roles = User.FindAll(ClaimTypes.Role).Select(c => c.Value).ToList()
+            DisplayName =
+                User.FindFirstValue(ClaimTypes.Name) ?? "",
+
+            MobileNumber =
+                User.FindFirstValue(ClaimTypes.MobilePhone) ?? "",
+
+            Tc =
+                Guid.TryParse(
+                    User.FindFirstValue(
+                        ClaimTypes.NameIdentifier),
+                    out var g)
+                    ? g
+                    : Guid.Empty,
+
+            Roles =
+                User.FindAll(ClaimTypes.Role)
+                    .Select(c => c.Value)
+                    .ToList()
         });
     }
 
     private static bool IsValidMobile(string mobile)
     {
-        return Regex.IsMatch(mobile, @"^09\d{9}$");
+        return Regex.IsMatch(
+            mobile,
+            @"^09\d{9}$");
     }
 }

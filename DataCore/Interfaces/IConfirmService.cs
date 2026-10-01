@@ -1,14 +1,14 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace DataCore.Interfaces
 {
     public interface IConfirmService
     {
-        void SendCode(string mobileNumber);
-        bool VerifyCode(string mobileNumber, string code);
+        void SendCode(string mobileNumber, string ipUser);
+
+        bool VerifyCode(
+            string mobileNumber,
+            string code,
+            out string message);
     }
 }
